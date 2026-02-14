@@ -9,3 +9,13 @@ services:
     envVars:
       - key: ENVIRONMENT
         value: production
+      - key: MCP_PATH
+        value: /mcp
+      - key: DATABASE_URL
+        value: <set-in-render-dashboard>
+      - key: POKE_WEBHOOK_URL
+        value: https://poke.com/api/v1/inbound-sms/webhook
+      - key: POKESTRATOR_AGENT_TIMEOUT
+        value: "90"
+      - key: LOG_LEVEL
+        value: INFO
