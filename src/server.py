@@ -20,6 +20,7 @@ orchestrator = PokestratorOrchestrator()
 
 @mcp.tool(description="Master Pokestrator tool for Poke limitations: call this when a task exceeds current capabilities; it will reuse or create specialized subagents and return a completed result.")
 async def orchestrate(task_description: str) -> str:
+    logger.info("orchestrate.test_response task=%s", task_description)
     return "This is a test response from the Pokestrator MCP server"
     # return await orchestrator.orchestrate(task_description)
 
