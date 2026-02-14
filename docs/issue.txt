@@ -1,0 +1,3 @@
+Limitation: Unable to provide historical Google Search Console performance metrics and competitive keyword analysis
+User request: "Show me how the website (suno.com) ranks compared to competitors (elevenlabs.io) for key search terms"
+Context: User needs detailed SEO analytics including competitor ranking comparisons and trend analysis that requires access to both Google Search Console API and third-party SEO tools
