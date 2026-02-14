@@ -10,11 +10,7 @@ from typing import Any
 
 from db import Subagent, get_all_subagents, get_subagent_by_name, init_db, insert_subagent
 from poke import send_poke_message
-
-try:
-    import claude_agent_sdk as claude_sdk
-except Exception:
-    claude_sdk = None
+import claude_agent_sdk as claude_sdk
 
 logger = logging.getLogger("pokestrator.agent")
 
@@ -53,6 +49,8 @@ STOP_WORDS = {
 class PokestratorOrchestrator:
     def __init__(self):
         self.timeout_seconds = int(os.getenv("POKESTRATOR_AGENT_TIMEOUT", "90"))
+        self.permission_mode = os.getenv("POKESTRATOR_PERMISSION_MODE", "bypassPermissions")
+        self.tools_preset = os.getenv("POKESTRATOR_TOOLS_PRESET", "claude_code")
 
     async def orchestrate(
         self, request_id: str, task_description: str, metadata: str | None = None
@@ -151,12 +149,19 @@ class PokestratorOrchestrator:
     ) -> str:
         if claude_sdk is None:
             logger.info(
-                "claude sdk unavailable; using deterministic fallback for request_id=%s",
+                "claude sdk import unavailable; using fallback for request_id=%s",
                 request_id,
             )
-            return self._simulate_subagent_response(subagent.name, task_description)
+            return self._simulate_subagent_response(
+                subagent_name=subagent.name,
+                task_description=task_description,
+                reason=(
+                    "claude_agent_sdk is not available in this runtime "
+                    "(import failed or package missing)"
+                ),
+            )
 
-        return await self._run_claude_agent(subagent, task_description)
+        return await self._run_claude_agent(subagent, task_description, request_id)
 
     async def _load_template(self, template_name: str) -> Subagent | None:
         template_path = TEMPLATES_DIR / f"{template_name}.json"
@@ -198,18 +203,15 @@ class PokestratorOrchestrator:
             return candidate
 
     async def _store_generated_subagent(self, name_hint: str, task_description: str) -> None:
+        name, description, system_prompt = await self._build_generated_subagent_spec(
+            name_hint=name_hint,
+            task_description=task_description,
+        )
         generated = Subagent(
             id="",
-            name=name_hint,
-            description=(
-                f"Auto-generated agent for: {task_description[:180]}"
-                if task_description
-                else "Auto-generated subagent"
-            ),
-            system_prompt=(
-                "You are an AI coding and support assistant that solves tasks exactly "
-                f"as requested: {task_description[:500]}."
-            ),
+            name=name,
+            description=description,
+            system_prompt=system_prompt,
         )
 
         try:
@@ -230,11 +232,21 @@ class PokestratorOrchestrator:
         except Exception:
             logger.exception("failed to store generated subagent name=%s", generated.name)
 
-    async def _run_claude_agent(self, subagent: Subagent, task_description: str) -> str:
+    async def _run_claude_agent(
+        self, subagent: Subagent, task_description: str, request_id: str
+    ) -> str:
+        logger.info(
+            "starting claude run request_id=%s subagent=%s timeout_seconds=%s permission_mode=%s tools_preset=%s",
+            request_id,
+            subagent.name,
+            self.timeout_seconds,
+            self.permission_mode,
+            self.tools_preset,
+        )
         options = claude_sdk.ClaudeAgentOptions(
             system_prompt=subagent.system_prompt,
-            allowed_tools=["Bash", "Read", "Write"],
-            permission_mode="acceptEdits",
+            tools={"type": "preset", "preset": self.tools_preset},
+            permission_mode=self.permission_mode,
         )
 
         try:
@@ -242,7 +254,9 @@ class PokestratorOrchestrator:
         except Exception as exc:
             logger.exception("failed to initialize claude query")
             return self._simulate_subagent_response(
-                subagent.name, f"{task_description} ({exc})"
+                subagent_name=subagent.name,
+                task_description=task_description,
+                reason=f"claude query initialization failed: {exc}",
             )
 
         if asyncio.iscoroutine(stream):
@@ -264,14 +278,30 @@ class PokestratorOrchestrator:
                 return final_result.strip()
             if chunks:
                 return "\n".join(chunks).strip()
-            return self._simulate_subagent_response(subagent.name, task_description)
+            logger.warning(
+                "claude run produced no output request_id=%s subagent=%s",
+                request_id,
+                subagent.name,
+            )
+            return self._simulate_subagent_response(
+                subagent_name=subagent.name,
+                task_description=task_description,
+                reason="claude run completed without output",
+            )
 
         try:
             return await asyncio.wait_for(consume(), timeout=self.timeout_seconds)
         except asyncio.TimeoutError:
-            return self._simulate_subagent_response(
+            logger.warning(
+                "claude run timed out request_id=%s subagent=%s timeout_seconds=%s",
+                request_id,
                 subagent.name,
-                f"{task_description} (timed out waiting for Claude SDK)",
+                self.timeout_seconds,
+            )
+            return self._simulate_subagent_response(
+                subagent_name=subagent.name,
+                task_description=task_description,
+                reason=f"claude run timed out after {self.timeout_seconds}s",
             )
 
     def _match_template(self, task: str) -> str | None:
@@ -305,13 +335,156 @@ class PokestratorOrchestrator:
         return winner if winner_score >= 2 else None
 
     def _build_new_subagent_name(self, task_description: str) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "_", task_description.lower().strip())
-        slug = slug.strip("_")
-        if len(slug) < 6:
-            slug = "generated_subagent"
+        slug = re.sub(r"[^a-z0-9]+", "_", task_description.lower()).strip("_")
+        if not slug:
+            slug = "general_task_automation"
         if len(slug) > 56:
             slug = slug[:56].strip("_")
-        return f"auto_{slug[:56]}"
+        return f"auto_{slug}"
+
+    async def _build_generated_subagent_spec(
+        self, name_hint: str, task_description: str
+    ) -> tuple[str, str, str]:
+        analyzed = await self._analyze_task_with_orchestrator(task_description)
+        name = self._normalize_subagent_name(
+            analyzed.get("name"),
+            name_hint or "auto_general_task_automation",
+        )
+        description = self._normalize_text_field(
+            analyzed.get("description"),
+            fallback="",
+            max_len=240,
+        )
+        system_prompt = self._normalize_text_field(
+            analyzed.get("system_prompt"),
+            fallback="",
+            max_len=2400,
+        )
+
+        if not description or not system_prompt:
+            raise RuntimeError(
+                "orchestrator capability analysis returned incomplete spec fields"
+            )
+
+        logger.info("generated reusable subagent spec name=%s", name)
+        return name, description, system_prompt
+
+    async def _analyze_task_with_orchestrator(
+        self, task_description: str
+    ) -> dict[str, str]:
+        if claude_sdk is None:
+            raise RuntimeError(
+                "cannot analyze capability with orchestrator: claude sdk unavailable"
+            )
+
+        analysis_prompt = (
+            "Analyze this task and design a reusable subagent spec that can solve future similar "
+            "requests, not just this one instance.\n\n"
+            f"TASK:\n{task_description}\n\n"
+            "Return ONLY a JSON object with exactly these keys:\n"
+            '{\n'
+            '  "name": "auto_snake_case_name",\n'
+            '  "description": "one-sentence reusable capability summary",\n'
+            '  "system_prompt": "multi-sentence reusable instructions"\n'
+            "}\n\n"
+            "Rules:\n"
+            "- Generalize across target entities, date ranges, geographies, and filters.\n"
+            "- Do not hardcode a single person/company/date.\n"
+            "- Keep name concise, snake_case, and prefixed with auto_.\n"
+            "- Description should describe the capability class, not one request.\n"
+        )
+
+        options = claude_sdk.ClaudeAgentOptions(
+            system_prompt=(
+                "You generate reusable subagent specifications for an orchestrator system. "
+                "Output strict JSON only."
+            ),
+            allowed_tools=[],
+            max_turns=1,
+            permission_mode=self.permission_mode,
+        )
+
+        try:
+            stream = claude_sdk.query(prompt=analysis_prompt, options=options)
+            if asyncio.iscoroutine(stream):
+                stream = await stream
+            response_text = await asyncio.wait_for(
+                self._collect_response_text(stream),
+                timeout=min(self.timeout_seconds, 45),
+            )
+        except Exception as exc:
+            logger.exception("orchestrator capability analysis failed")
+            raise RuntimeError("orchestrator capability analysis failed") from exc
+
+        parsed = self._parse_json_object(response_text)
+        if not parsed:
+            raise RuntimeError(
+                "orchestrator capability analysis did not return valid JSON"
+            )
+
+        return {
+            "name": str(parsed.get("name", "")).strip(),
+            "description": str(parsed.get("description", "")).strip(),
+            "system_prompt": str(parsed.get("system_prompt", "")).strip(),
+        }
+
+    async def _collect_response_text(self, stream: Any) -> str:
+        final_result: str | None = None
+        chunks: list[str] = []
+
+        async for event in stream:
+            candidate = self._extract_text(event)
+            if candidate:
+                chunks.append(candidate)
+            event_result = self._extract_result(event)
+            if event_result:
+                final_result = event_result
+
+        if final_result:
+            return final_result.strip()
+        return "\n".join(chunks).strip()
+
+    def _parse_json_object(self, text: str) -> dict[str, Any] | None:
+        if not text:
+            return None
+
+        candidates: list[str] = [text.strip()]
+
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+        if fence_match:
+            candidates.append(fence_match.group(1).strip())
+
+        brace_match = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+        if brace_match:
+            candidates.append(brace_match.group(1).strip())
+
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+
+        return None
+
+    def _normalize_subagent_name(self, value: Any, fallback: str) -> str:
+        raw = str(value or "").strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+        if not slug:
+            slug = re.sub(r"[^a-z0-9]+", "_", fallback.lower()).strip("_")
+        if not slug:
+            slug = "auto_general_task_automation"
+        if not slug.startswith("auto_"):
+            slug = f"auto_{slug}"
+        return slug[:64].strip("_")
+
+    def _normalize_text_field(self, value: Any, fallback: str, max_len: int) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        text = re.sub(r"\s+", " ", text)
+        return text[:max_len].strip()
 
     def _extract_text(self, event: Any) -> str:
         if event is None:
@@ -357,10 +530,13 @@ class PokestratorOrchestrator:
         value = getattr(event, "result", None)
         return value if isinstance(value, str) and value.strip() else None
 
-    def _simulate_subagent_response(self, subagent_name: str, task_description: str) -> str:
+    def _simulate_subagent_response(
+        self, subagent_name: str, task_description: str, reason: str
+    ) -> str:
         return (
-            f"[Fallback {subagent_name}] Received: {task_description}. "
-            "I don't have direct Claude SDK execution in this environment."
+            f"[Fallback {subagent_name}] Unable to complete task. "
+            f"Reason: {reason}. "
+            f"Task: {task_description}"
         )
 
     def _format_poke_message(self, result: str, request_id: str) -> str:
