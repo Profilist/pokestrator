@@ -28,8 +28,6 @@ async def orchestrate(task_description: str) -> str:
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-
-    # Poke spec expects /sse endpoint for MCP integration.
     mcp_path = os.getenv("MCP_PATH", "/sse")
 
     logger.info("Starting FastMCP server host=%s port=%s path=%s", host, port, mcp_path)
