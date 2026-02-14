@@ -1,12 +1,16 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import uuid
 
 from fastmcp import FastMCP
 
 from agent import PokestratorOrchestrator
+from db import close_db, init_db
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -16,24 +20,57 @@ logger = logging.getLogger("pokestrator")
 
 mcp = FastMCP("Pokestrator")
 orchestrator = PokestratorOrchestrator()
+background_tasks: set[asyncio.Task] = set()
 
 
-@mcp.tool(description="Master Pokestrator tool for Poke limitations: call this when a task exceeds current capabilities; it will reuse or create specialized subagents and return a completed result.")
-async def orchestrate(task_description: str) -> str:
-    logger.info("orchestrate.test_response task=%s", task_description)
-    return "This is a test response from the Pokestrator MCP server"
-    # return await orchestrator.orchestrate(task_description)
+@mcp.tool(
+    description=(
+        "Master Pokestrator tool for Poke limitations: call this when a task exceeds current "
+        "capabilities; it will reuse or create specialized subagents and delegate asynchronously."
+    )
+)
+async def orchestrate(task_description: str, metadata: str = "") -> str:
+    request_id = str(uuid.uuid4())
+    logger.info("accepted orchestrate request_id=%s", request_id)
+
+    task = asyncio.create_task(orchestrator.orchestrate(request_id, task_description, metadata))
+
+    background_tasks.add(task)
+    task.add_done_callback(lambda done: background_tasks.discard(done))
+
+    return json.dumps(
+        {
+            "status": "accepted",
+            "request_id": request_id,
+            "message": (
+                "Task accepted and running asynchronously. "
+                "Result will be posted back to Poke when complete."
+            ),
+        }
+    )
+
+
+async def main() -> None:
+    try:
+        await init_db()
+    except Exception:
+        logger.exception("database init failed; running in degraded mode without DB persistence")
+
+    mcp.run(
+        transport="sse",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
+        path=os.getenv("MCP_PATH", "/mcp"),
+    )
 
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    mcp_path = os.getenv("MCP_PATH", "/sse")
-
-    logger.info("Starting FastMCP server host=%s port=%s path=%s", host, port, mcp_path)
-    mcp.run(
-        transport="sse",
-        host=host,
-        port=port,
-        path=mcp_path,
-    )
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down Pokestrator")
+    finally:
+        try:
+            asyncio.run(close_db())
+        except RuntimeError:
+            pass
