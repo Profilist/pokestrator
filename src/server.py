@@ -1,31 +1,40 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
+from __future__ import annotations
+
+import logging
 import os
+
 from fastmcp import FastMCP
 
-mcp = FastMCP("Sample MCP Server")
+from agent import PokestratorOrchestrator
 
-@mcp.tool(description="Greet a user by name with a welcome message from the MCP server")
-def greet(name: str) -> str:
-    return f"Hello, {name}! Welcome to our sample MCP server running on Heroku!"
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("pokestrator")
 
-@mcp.tool(description="Get information about the MCP server including name, version, environment, and Python version")
-def get_server_info() -> dict:
-    return {
-        "server_name": "Sample MCP Server",
-        "version": "1.0.0",
-        "environment": os.environ.get("ENVIRONMENT", "development"),
-        "python_version": os.sys.version.split()[0]
-    }
+mcp = FastMCP("Pokestrator")
+orchestrator = PokestratorOrchestrator()
+
+
+@mcp.tool(description="Master Pokestrator tool for Poke limitations: call this when a task exceeds current capabilities; it will reuse or create specialized subagents and return a completed result.")
+async def orchestrate(task_description: str) -> str:
+    return "This is a test response from the Pokestrator MCP server"
+    # return await orchestrator.orchestrate(task_description)
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    host = "0.0.0.0"
-    
-    print(f"Starting FastMCP server on {host}:{port}")
-    
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+
+    # Poke spec expects /sse endpoint for MCP integration.
+    mcp_path = os.getenv("MCP_PATH", "/sse")
+
+    logger.info("Starting FastMCP server host=%s port=%s path=%s", host, port, mcp_path)
     mcp.run(
-        transport="http",
+        transport="sse",
         host=host,
         port=port,
-        stateless_http=True
+        path=mcp_path,
     )
