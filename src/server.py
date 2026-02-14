@@ -50,9 +50,9 @@ async def orchestrate(task_description: str, metadata: str = "") -> str:
     )
 
 
-async def main() -> None:
+def main() -> None:
     try:
-        await init_db()
+        asyncio.run(init_db())
     except Exception:
         logger.exception("database init failed; running in degraded mode without DB persistence")
 
@@ -66,7 +66,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logger.info("Shutting down Pokestrator")
     finally:
