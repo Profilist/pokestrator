@@ -10,7 +10,6 @@ import uuid
 from fastmcp import FastMCP
 
 from agent import PokestratorOrchestrator
-from db import close_db, init_db
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -51,11 +50,6 @@ async def orchestrate(task_description: str, metadata: str = "") -> str:
 
 
 def main() -> None:
-    try:
-        asyncio.run(init_db())
-    except Exception:
-        logger.exception("database init failed; running in degraded mode without DB persistence")
-
     mcp.run(
         transport="sse",
         host=os.getenv("HOST", "0.0.0.0"),
@@ -69,8 +63,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         logger.info("Shutting down Pokestrator")
-    finally:
-        try:
-            asyncio.run(close_db())
-        except RuntimeError:
-            pass
