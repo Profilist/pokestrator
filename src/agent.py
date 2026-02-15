@@ -10,47 +10,55 @@ from typing import Any
 
 from db import Subagent, get_all_subagents, get_subagent_by_name, init_db, insert_subagent
 from poke import send_poke_message
+from routing import SubagentRouter
 import claude_agent_sdk as claude_sdk
 
 logger = logging.getLogger("pokestrator.agent")
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-RETRY_MESSAGE = (
-    "I noticed I don't have the capability to handle this yet. "
-    "I have just built and saved a new subagent to handle this. "
-    "Please ask me your question again."
-)
-STOP_WORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "for",
-    "from",
-    "how",
-    "i",
-    "in",
-    "is",
-    "it",
-    "my",
-    "of",
-    "on",
-    "the",
-    "to",
-    "with",
-    "me",
-    "you",
-    "your",
-}
-
-
 class PokestratorOrchestrator:
     def __init__(self):
-        self.timeout_seconds = int(os.getenv("POKESTRATOR_AGENT_TIMEOUT", "90"))
+        self.timeout_seconds = int(os.getenv("POKESTRATOR_AGENT_TIMEOUT", "180"))
         self.permission_mode = os.getenv("POKESTRATOR_PERMISSION_MODE", "bypassPermissions")
         self.tools_preset = os.getenv("POKESTRATOR_TOOLS_PRESET", "claude_code")
+        self.route_min_score = max(1, int(os.getenv("POKESTRATOR_ROUTE_MIN_SCORE", "2")))
+        self.route_confident_score = max(
+            self.route_min_score,
+            int(os.getenv("POKESTRATOR_ROUTE_CONFIDENT_SCORE", "7")),
+        )
+        self.route_confident_margin = max(
+            1,
+            int(os.getenv("POKESTRATOR_ROUTE_CONFIDENT_MARGIN", "4")),
+        )
+        self.route_llm_enabled = os.getenv("POKESTRATOR_ROUTE_LLM_ENABLED", "1") == "1"
+        self.route_llm_top_k = max(1, int(os.getenv("POKESTRATOR_ROUTE_LLM_TOP_K", "3")))
+        self.route_llm_timeout_seconds = max(
+            3,
+            int(os.getenv("POKESTRATOR_ROUTE_LLM_TIMEOUT_SECONDS", "12")),
+        )
+        self.route_llm_min_confidence = min(
+            1.0,
+            max(0.0, float(os.getenv("POKESTRATOR_ROUTE_LLM_MIN_CONFIDENCE", "0.6"))),
+        )
+        self.log_agent_events = os.getenv("POKESTRATOR_LOG_AGENT_EVENTS", "1") == "1"
+        self.event_text_preview_len = int(
+            os.getenv("POKESTRATOR_AGENT_EVENT_TEXT_PREVIEW_LEN", "260")
+        )
+        self.router = SubagentRouter(
+            permission_mode=self.permission_mode,
+            timeout_seconds=self.timeout_seconds,
+            route_min_score=self.route_min_score,
+            route_confident_score=self.route_confident_score,
+            route_confident_margin=self.route_confident_margin,
+            route_llm_enabled=self.route_llm_enabled,
+            route_llm_top_k=self.route_llm_top_k,
+            route_llm_timeout_seconds=self.route_llm_timeout_seconds,
+            route_llm_min_confidence=self.route_llm_min_confidence,
+            collect_response_text=self._collect_response_text,
+            parse_json_object=self._parse_json_object,
+            normalize_text_field=self._normalize_text_field,
+            preview_text=self._preview,
+        )
 
     async def orchestrate(
         self, request_id: str, task_description: str, metadata: str | None = None
@@ -80,13 +88,21 @@ class PokestratorOrchestrator:
             if metadata_dict:
                 payload["metadata"] = metadata_dict
 
+            callback_message = self._format_poke_message(result, request_id)
+            logger.info(
+                "poke callback outgoing request_id=%s message=%s payload=%s",
+                request_id,
+                callback_message,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            )
             callback_result = await asyncio.to_thread(
-                send_poke_message, self._format_poke_message(result, request_id), payload
+                send_poke_message, callback_message, payload
             )
             logger.info(
-                "poke callback sent request_id=%s status=%s",
+                "poke callback sent request_id=%s status=%s response=%s",
                 request_id,
                 callback_result.get("status_code", "dry_run"),
+                callback_result.get("response", ""),
             )
             return result
         except Exception as exc:
@@ -99,31 +115,32 @@ class PokestratorOrchestrator:
                 "error": str(exc),
             }
             try:
+                callback_message = self._format_poke_message(err, request_id)
+                logger.info(
+                    "poke callback outgoing request_id=%s message=%s payload=%s",
+                    request_id,
+                    callback_message,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                )
                 await asyncio.to_thread(
-                    send_poke_message, self._format_poke_message(err, request_id), payload
+                    send_poke_message, callback_message, payload
                 )
             except Exception:
                 logger.exception("failed to post failure message to poke")
             return err
 
     async def _decide_route(self, task_description: str) -> dict[str, Any]:
-        task = task_description.lower()
-
         try:
             subagents = await get_all_subagents()
         except Exception:
             logger.exception("failed to load subagents, continuing with empty list")
             subagents = []
 
-        match = self._match_existing_subagent(task, subagents)
-        if match:
-            return {"branch": "match", "subagent": match}
-
-        template_name = self._match_template(task)
-        if template_name:
-            return {"branch": "template", "template_name": template_name}
-
-        return {"branch": "build_new", "new_subagent_name": self._build_new_subagent_name(task_description)}
+        return await self.router.decide_route(
+            task_description=task_description,
+            subagents=subagents,
+            build_new_subagent_name=self._build_new_subagent_name,
+        )
 
     async def _execute_decision(
         self, task_description: str, decision: dict[str, Any], request_id: str
@@ -133,20 +150,26 @@ class PokestratorOrchestrator:
             subagent = decision["subagent"]
             return await self._run_subagent(subagent, task_description, request_id)
 
-        if branch == "template":
-            template_name = decision["template_name"]
-            template_subagent = await self._load_template(template_name)
-            if template_subagent is None:
-                raise RuntimeError(f"template '{template_name}' is missing or invalid")
-            return await self._run_subagent(template_subagent, task_description, request_id)
-
-        _ = decision["new_subagent_name"]
-        await self._store_generated_subagent(decision["new_subagent_name"], task_description)
-        return RETRY_MESSAGE
+        subagent = await self._store_generated_subagent(
+            decision["new_subagent_name"],
+            task_description,
+        )
+        logger.info(
+            "orchestrator route=build_new running newly available subagent=%s request_id=%s",
+            subagent.name,
+            request_id,
+        )
+        return await self._run_subagent(subagent, task_description, request_id)
 
     async def _run_subagent(
         self, subagent: Subagent, task_description: str, request_id: str
     ) -> str:
+        logger.info(
+            "running subagent request_id=%s subagent=%s description=%s",
+            request_id,
+            subagent.name,
+            self._preview(subagent.description),
+        )
         if claude_sdk is None:
             logger.info(
                 "claude sdk import unavailable; using fallback for request_id=%s",
@@ -202,7 +225,7 @@ class PokestratorOrchestrator:
             logger.exception("failed to persist template='%s' to DB; using in-memory copy", template_name)
             return candidate
 
-    async def _store_generated_subagent(self, name_hint: str, task_description: str) -> None:
+    async def _store_generated_subagent(self, name_hint: str, task_description: str) -> Subagent:
         name, description, system_prompt = await self._build_generated_subagent_spec(
             name_hint=name_hint,
             task_description=task_description,
@@ -217,20 +240,23 @@ class PokestratorOrchestrator:
         try:
             existing = await get_subagent_by_name(generated.name)
             if existing:
-                return
+                logger.info("reusing existing generated subagent name=%s", existing.name)
+                return existing
         except Exception:
             logger.exception("could not check existing subagent before insert: name=%s", generated.name)
-            return
+            return generated
 
         try:
-            await insert_subagent(
+            stored = await insert_subagent(
                 generated.name,
                 generated.description,
                 generated.system_prompt,
             )
             logger.info("stored generated subagent name=%s", generated.name)
+            return stored
         except Exception:
             logger.exception("failed to store generated subagent name=%s", generated.name)
+            return generated
 
     async def _run_claude_agent(
         self, subagent: Subagent, task_description: str, request_id: str
@@ -265,14 +291,48 @@ class PokestratorOrchestrator:
         async def consume() -> str:
             final_result: str | None = None
             chunks: list[str] = []
+            event_count = 0
 
             async for event in stream:
+                event_count += 1
+                if self.log_agent_events:
+                    logger.info(
+                        "claude event request_id=%s subagent=%s idx=%s type=%s",
+                        request_id,
+                        subagent.name,
+                        event_count,
+                        type(event).__name__,
+                    )
+                    tool_names = self._extract_tool_names(event)
+                    if tool_names:
+                        logger.info(
+                            "claude event tools request_id=%s subagent=%s idx=%s tools=%s",
+                            request_id,
+                            subagent.name,
+                            event_count,
+                            ",".join(tool_names),
+                        )
                 candidate = self._extract_text(event)
                 if candidate:
                     chunks.append(candidate)
+                    if self.log_agent_events:
+                        logger.info(
+                            "claude event text request_id=%s subagent=%s idx=%s text=%s",
+                            request_id,
+                            subagent.name,
+                            event_count,
+                            self._preview(candidate),
+                        )
                 event_result = self._extract_result(event)
                 if event_result:
                     final_result = event_result
+                    logger.info(
+                        "claude event result request_id=%s subagent=%s idx=%s text=%s",
+                        request_id,
+                        subagent.name,
+                        event_count,
+                        self._preview(event_result),
+                    )
 
             if final_result:
                 return final_result.strip()
@@ -304,35 +364,21 @@ class PokestratorOrchestrator:
                 reason=f"claude run timed out after {self.timeout_seconds}s",
             )
 
-    def _match_template(self, task: str) -> str | None:
-        if "stripe" in task and ("income" in task or "revenue" in task):
-            return "stripe_analyst"
-        if "use a template" in task and "stripe" in task:
-            return "stripe_analyst"
-        return None
-
     def _match_existing_subagent(self, task: str, subagents: list[Subagent]) -> Subagent | None:
-        task_tokens = self._tokenize(task)
-        if not task_tokens:
-            return None
+        return self.router.match_existing_subagent(task, subagents)
 
-        winner = None
-        winner_score = 0
+    def _rank_existing_subagents(
+        self, task: str, subagents: list[Subagent]
+    ) -> list[dict[str, Any]]:
+        return self.router.rank_existing_subagents(task, subagents)
 
-        for subagent in subagents:
-            score = 0
-            name_text = f" {subagent.name.lower()} "
-            description_text = f" {subagent.description.lower()} "
-            for token in task_tokens:
-                if token in name_text:
-                    score += 3
-                if token in description_text:
-                    score += 1
-            if score > winner_score:
-                winner = subagent
-                winner_score = score
+    def _is_confident_ranked_match(self, ranked_matches: list[dict[str, Any]]) -> bool:
+        return self.router.is_confident_ranked_match(ranked_matches)
 
-        return winner if winner_score >= 2 else None
+    async def _llm_validate_ranked_match(
+        self, task_description: str, ranked_matches: list[dict[str, Any]]
+    ) -> Subagent | None:
+        return await self.router.llm_validate_ranked_match(task_description, ranked_matches)
 
     def _build_new_subagent_name(self, task_description: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "_", task_description.lower()).strip("_")
@@ -468,6 +514,9 @@ class PokestratorOrchestrator:
 
         return None
 
+    def _normalize_confidence(self, value: Any) -> float:
+        return self.router.normalize_confidence(value)
+
     def _normalize_subagent_name(self, value: Any, fallback: str) -> str:
         raw = str(value or "").strip().lower()
         slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
@@ -485,6 +534,33 @@ class PokestratorOrchestrator:
             return fallback
         text = re.sub(r"\s+", " ", text)
         return text[:max_len].strip()
+
+    def _preview(self, value: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(normalized) <= self.event_text_preview_len:
+            return normalized
+        return f"{normalized[: self.event_text_preview_len - 3]}..."
+
+    def _extract_tool_names(self, event: Any) -> list[str]:
+        names: list[str] = []
+
+        if isinstance(event, dict):
+            content = event.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        name = block.get("name")
+                        if isinstance(name, str) and name.strip():
+                            names.append(name.strip())
+            return names
+
+        content = getattr(event, "content", None)
+        if isinstance(content, list):
+            for block in content:
+                name = getattr(block, "name", None)
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+        return names
 
     def _extract_text(self, event: Any) -> str:
         if event is None:
@@ -553,5 +629,4 @@ class PokestratorOrchestrator:
             return None
 
     def _tokenize(self, text: str) -> set[str]:
-        raw_tokens = re.findall(r"[a-z0-9]+", text.lower())
-        return {token for token in raw_tokens if len(token) > 2 and token not in STOP_WORDS}
+        return self.router.tokenize(text)
