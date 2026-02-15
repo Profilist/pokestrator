@@ -46,6 +46,24 @@ pip install -r requirements.txt
 python src/server.py
 ```
 
+## Demo frontend (React)
+
+A lightweight React dashboard is included under `frontend/` to visualize live
+orchestrator/subagent activity from the runtime log file.
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173` while the MCP server is running.
+
+Notes:
+- The frontend polls `/api/demo-state` every ~1.2 seconds.
+- The API is served by Vite middleware and parses `logs/pokestrator.log` by default.
+- Override log source with `POKESTRATOR_LOG_FILE` (absolute path or workspace-relative).
+
 ## Deploy (Render)
 
 `render.yaml` already includes a web service and startup command.

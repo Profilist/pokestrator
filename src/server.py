@@ -54,8 +54,15 @@ background_tasks: set[asyncio.Task] = set()
 
 @mcp.tool(
     description=(
-        "Master Pokestrator tool for Poke limitations: call this when a task exceeds current "
-        "capabilities; it will reuse or create specialized subagents and delegate asynchronously."
+        "Call this tool whenever you cannot fully complete a task with your built-in capabilities — "
+        "whether it requires an external API you lack (e.g. Stripe, Shopify), a system-level "
+        "action (e.g. checking CPU or memory usage), or any other skill you do not natively have. "
+        "When external providers are needed, Pokestrator uses managed credentials from a 1Password-backed key store; "
+        "users should never paste secrets into chat. "
+        "Pokestrator maintains a growing library of specialized subagents: if one already exists for "
+        "the task (even from a previous conversation), it will be reused automatically. If not, a new "
+        "one will be created on the fly. Always prefer calling this tool over telling the user you "
+        "cannot do something."
     )
 )
 async def orchestrate(task_description: str, metadata: str = "") -> str:
@@ -82,7 +89,6 @@ async def orchestrate(task_description: str, metadata: str = "") -> str:
             ),
         }
     )
-
 
 def main() -> None:
     mcp.run(
